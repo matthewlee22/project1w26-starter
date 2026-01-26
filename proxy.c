@@ -8,9 +8,9 @@
 #include <openssl/err.h>
 
 #define BUFFER_SIZE 1024
-#define LOCAL_PORT_TO_CLIENT 8443
-#define REMOTE_HOST "127.0.0.1"
-#define REMOTE_PORT 5001
+int LOCAL_PORT_TO_CLIENT = 8443;
+char REMOTE_HOST[256] = "127.0.0.1";
+int REMOTE_PORT = 5001;
 
 void handle_request(SSL *ssl);
 void send_local_file(SSL *ssl, const char *path);
@@ -20,8 +20,45 @@ int file_exists(const char *filename);
 // TODO: Parse command-line arguments (-b/-r/-p) and override defaults.
 // Keep behavior consistent with the project spec.
 void parse_args(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "-b") == 0) {
+            // check if there is value next to -b
+            if (i + 1 < argc) {
+                LOCAL_PORT_TO_CLIENT = atoi(argv[i+1]);
+                i += 2;
+            }
+            else {
+                fprintf(stderr, "Missing required argument for -b");
+                exit(1);
+            }
+        }
+        else if (strcmp(argv[i], "-r") == 0) {
+            if (i + 1 < argc) {
+                strncpy(REMOTE_HOST, argv[i+1], sizeof(REMOTE_HOST) - 1);
+                REMOTE_HOST[sizeof(REMOTE_HOST) - 1] = '\0';
+                i += 2;
+            }
+            else {
+                fprintf(stderr, "Missing required argument for -r");
+                exit(1);
+            }
+        }
+        else if (strcmp(argv[i], "-p") == 0) {
+            if (i + 1 < argc) {
+                REMOTE_PORT = atoi(argv[i+1]);
+                i += 2;
+            }
+            else {
+                fprintf(stderr, "Missing required argument for -p");
+                exit(1);
+            }
+        }
+        else {
+            fprintf(stderr, "Unsupported argument: %s\n", argv[i]);
+            exit(1);
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -32,14 +69,32 @@ int main(int argc, char *argv[]) {
     parse_args(argc, argv);
 
     // TODO: Initialize OpenSSL library
-    
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
     
     // TODO: Create SSL context and load certificate/private key files
     // Files: "server.crt" and "server.key"
-    SSL_CTX *ssl_ctx = NULL;
+    const SSL_METHOD *method = SSLv23_server_method();
+    SSL_CTX *ssl_ctx = SSL_CTX_new(method);
     
     if (ssl_ctx == NULL) {
         fprintf(stderr, "Error: SSL context not initialized\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_certificate_file(ssl_ctx, "server.crt", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ssl_ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+
+    if (SSL_CTX_check_private_key(ssl_ctx) != 1) {
+        fprintf(stderr, "Error: Private key does not match the certificate public key\n");
+        ERR_print_errors_fp(stderr);
         exit(EXIT_FAILURE);
     }
 
@@ -69,6 +124,7 @@ int main(int argc, char *argv[]) {
     printf("Proxy server listening on port %d\n", LOCAL_PORT_TO_CLIENT);
 
     while (1) {
+        client_len = sizeof(client_addr);
         client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
         if (client_socket == -1) {
             perror("accept failed");
@@ -78,22 +134,46 @@ int main(int argc, char *argv[]) {
         printf("Accepted connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
         // TODO: Create SSL structure for this connection and perform SSL handshake
-        SSL *ssl = NULL;
+        SSL *ssl = SSL_new(ssl_ctx);
+
+        if (ssl == NULL) {
+            fprintf(stderr, "SSL_new failed");
+            ERR_print_errors_fp(stderr);
+            close(client_socket);
+            continue;
+        }
         
+        if (SSL_set_fd(ssl, client_socket) != 1) {
+            fprintf(stderr, "SSL_set_fd failed");
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(client_socket);
+            continue;
+        }
+
+        if (SSL_accept(ssl) != 1) {
+            fprintf(stderr, "SSL_accept handshake failed");
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(client_socket);
+            continue;
+        }
         
         if (ssl != NULL) {
             handle_request(ssl);
         }
         
         // TODO: Clean up SSL connection
-        
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
         
         close(client_socket);
     }
 
     close(server_socket);
     // TODO: Clean up SSL context
-    
+    SSL_CTX_free(ssl_ctx);
+
     return 0;
 }
 
@@ -113,7 +193,8 @@ void handle_request(SSL *ssl) {
     ssize_t bytes_read;
 
     // TODO: Read request from SSL connection
-    bytes_read = 0;
+    bytes_read = SSL_read(ssl, buffer, BUFFER_SIZE-1);
+
     
     if (bytes_read <= 0) {
         return;
@@ -154,7 +235,7 @@ void send_local_file(SSL *ssl, const char *path) {
                          "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
                          "<body><h1>404 Not Found</h1></body></html>";
         // TODO: Send response via SSL
-        
+        SSL_write(ssl, response, strlen(response));
         return;
     }
 
@@ -168,11 +249,14 @@ void send_local_file(SSL *ssl, const char *path) {
     }
 
     // TODO: Send response header and file content via SSL
-    
+    SSL_write(ssl, response, strlen(response));
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
         // TODO: Send file data via SSL
-        
+        int sent = SSL_write(ssl, buffer, (int)bytes_read);
+        if (sent <= 0) {
+            break;
+        }
     }
 
     fclose(file);
@@ -206,7 +290,10 @@ void proxy_remote_file(SSL *ssl, const char *request) {
 
     while ((bytes_read = recv(remote_socket, buffer, sizeof(buffer), 0)) > 0) {
         // TODO: Forward response to client via SSL
-        
+        int sent = SSL_write(ssl, buffer, (int)bytes_read);
+        if (sent <= 0) {
+            break;
+        }
     }
 
     close(remote_socket);
