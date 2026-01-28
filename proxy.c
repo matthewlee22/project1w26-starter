@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <signal.h>
 
 #define BUFFER_SIZE 1024
 int LOCAL_PORT_TO_CLIENT = 8443;
@@ -62,6 +63,8 @@ void parse_args(int argc, char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+    signal(SIGPIPE, SIG_IGN);
+
     int server_socket, client_socket;
     struct sockaddr_in server_addr, client_addr;
     socklen_t client_len;
@@ -108,13 +111,13 @@ int main(int argc, char *argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(LOCAL_PORT_TO_CLIENT);
 
+    int optval = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1) {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
-
-    int optval = 1;
-    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
 
     if (listen(server_socket, 10) == -1) {
         perror("listen failed");
@@ -178,7 +181,7 @@ int main(int argc, char *argv[]) {
 }
 
 int file_exists(const char *filename) {
-    FILE *file = fopen(filename, "r");
+    FILE *file = fopen(filename, "rb");
     if (file != NULL) {
         fclose(file);
         return 1;
@@ -202,23 +205,56 @@ void handle_request(SSL *ssl) {
 
     buffer[bytes_read] = '\0';
     char *request = malloc(strlen(buffer) + 1);
-    strcpy(request, buffer);
-    
-    char *method = strtok(request, " ");
-    char *file_name = strtok(NULL, " ");
-    file_name++;
-    if (strlen(file_name) == 0) {
-        strcat(file_name, "index.html");
-    }
-    char *http_version = strtok(NULL, " ");
 
-    if (file_exists(file_name)) {
-        printf("Sending local file %s\n", file_name);
-        send_local_file(ssl, file_name);
+    if (request == NULL) {
+        return;
+    }
+
+    strcpy(request, buffer);
+
+    char *method = strtok(request, " ");
+    if (method == NULL) {
+        free(request);
+        return;
+    }
+    char *file_name = strtok(NULL, " ");
+
+    if (file_name == NULL) {
+        free(request);
+        return;
+    }
+
+    if (file_name[0] == '/') {
+        file_name++;
+    }
+
+    char decoded_path[BUFFER_SIZE];
+    if (strlen(file_name) == 0) {
+        strcpy(decoded_path, "index.html");
     } else {
-        printf("Proxying remote file %s\n", file_name);
+        char *src = file_name;
+        char *dst = decoded_path;
+        while (*src) {
+            if (*src == '%' && src[1] && src[2]) {
+                char hex[3] = {src[1], src[2], '\0'};
+                *dst++ = (char)strtol(hex, NULL, 16);
+                src += 3;
+            }
+            else {
+                *dst++ = *src++;
+            }
+        }
+        *dst = '\0';
+    }
+
+    if (file_exists(decoded_path)) {
+        printf("Sending local file %s\n", decoded_path);
+        send_local_file(ssl, decoded_path);
+    } else {
+        printf("Proxying remote file %s\n", decoded_path);
         proxy_remote_file(ssl, buffer);
     }
+    free(request);
 }
 
 // TODO: Serve local file with correct Content-Type header
@@ -243,9 +279,22 @@ void send_local_file(SSL *ssl, const char *path) {
     if (strstr(path, ".html")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/html; charset=UTF-8\r\n\r\n";
-    } else {
+    } 
+    else if (strstr(path, ".jpg")) {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: image/jpeg\r\n\r\n";
+    }
+    else if (strstr(path, ".m3u8")) {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/vnd.apple.mpegurl; charset=UTF-8\r\n\r\n";
+    }
+    else if (strstr(path, ".txt")) {
         response = "HTTP/1.1 200 OK\r\n"
                    "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
+    }
+    else {
+        response = "HTTP/1.1 200 OK\r\n"
+                   "Content-Type: application/octet-stream\r\n\r\n";
     }
 
     // TODO: Send response header and file content via SSL
@@ -273,6 +322,11 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     remote_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (remote_socket == -1) {
         printf("Failed to create remote socket\n");
+        char *response = "HTTP/1.1 502 Bad Gateway\r\n"
+                         "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                         "<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+                         "<body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
         return;
     }
 
@@ -283,6 +337,11 @@ void proxy_remote_file(SSL *ssl, const char *request) {
     if (connect(remote_socket, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) == -1) {
         printf("Failed to connect to remote server\n");
         close(remote_socket);
+        char *response = "HTTP/1.1 502 Bad Gateway\r\n"
+                         "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+                         "<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head>"
+                         "<body><h1>502 Bad Gateway</h1></body></html>";
+        SSL_write(ssl, response, strlen(response));
         return;
     }
 
